@@ -15,6 +15,10 @@ constexpr char CLIENT_SECRET[] = "LZcpGsJVFApJV3dpv5zjVeVHlkVI43qQK9yoyfP4PkW78p
 // Thing and property names
 constexpr char THING_NAME[] = "MESCH_M_IOT_R1";
 constexpr char PROPERTY_NAME[] = "aI_in__Pres_PO_H2_out";
+constexpr char PROPERTY_VAR_NAME[] = "aI_in__Pres_PO_H2_out";
+// Direct lookup (faster, smaller payload). Leave empty if unknown.
+constexpr char THING_ID[] = "9ff4611c-bd42-4c69-86b4-9245cfb82037";
+constexpr char PROPERTY_ID[] = "26ac0e3f-49cf-484d-9f08-ca02a8c49698";
 
 // Pressure scaling
 constexpr float MAX_BAR_VALUE = 1.5f;  // 100%
@@ -127,47 +131,51 @@ float fetchPressure() {
   }
 
   HTTPClient http;
-  const char *thingsUrl = "https://api2.arduino.cc/iot/v2/things?show_properties=true";
+  // Single property endpoint (small payload). We bail on failure to avoid the huge list response.
+  if (strlen(THING_ID) == 0 || strlen(PROPERTY_ID) == 0) {
+    showStatus("IDs missing");
+    return -1.0f;
+  }
 
-  http.begin(secureClient, thingsUrl);
+  String url = String("https://api2.arduino.cc/iot/v2/things/") + THING_ID + "/properties/" + PROPERTY_ID;
+  http.begin(secureClient, url);
   http.addHeader("Authorization", String("Bearer ") + accessToken);
 
   int status = http.GET();
   if (status != HTTP_CODE_OK) {
     showStatus("Data err");
-    Serial.printf("Thing request failed: %d\n", status);
+    Serial.printf("Property request failed: %d\n", status);
     http.end();
     return -1.0f;
   }
 
-  DynamicJsonDocument doc(16384);
-  DeserializationError err = deserializeJson(doc, http.getStream());
+  StaticJsonDocument<256> filter;
+  filter["name"] = true;
+  filter["variable_name"] = true;
+  filter["last_value"] = true;
+
+  DynamicJsonDocument doc(768);
+  DeserializationError err =
+      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   if (err) {
     showStatus("Data parse");
-    Serial.printf("Thing parse error: %s\n", err.c_str());
+    Serial.printf("Property parse error (%s); payload len=%d\n", err.c_str(), http.getSize());
     http.end();
     return -1.0f;
   }
 
   float value = -1.0f;
-  for (JsonObject thing : doc.as<JsonArray>()) {
-    const char *name = thing["name"] | "";
-    if (strcmp(name, THING_NAME) != 0) {
-      continue;
-    }
-    for (JsonObject prop : thing["properties"].as<JsonArray>()) {
-      const char *propName = prop["name"] | "";
-      if (strcmp(propName, PROPERTY_NAME) == 0) {
-        value = prop["last_value"].as<float>();
-        break;
-      }
-    }
+  if (doc["last_value"].is<const char *>()) {
+    value = atof(doc["last_value"].as<const char *>());
+  } else {
+    value = doc["last_value"].as<float>();
   }
 
   http.end();
 
   if (value < 0.0f) {
     showStatus("No data");
+    Serial.printf("Parsed value missing; payload len=%d\n", http.getSize());
     return -1.0f;
   }
 
