@@ -29,14 +29,14 @@ constexpr char THING_ID[] = "9ff4611c-bd42-4c69-86b4-9245cfb82037";
 constexpr char PROPERTY_ID[] = "26ac0e3f-49cf-484d-9f08-ca02a8c49698";
 
 // Pressure scaling
-constexpr float MAX_BAR_VALUE = 1.5f;  // 100%
+constexpr float MAX_BAR_VALUE = 12.0f;  // 100%
 
 // Battery monitor pins (board variants show BAT_VOLT on GPIO2; some defs use GPIO8). Read both.
 constexpr int BATTERY_ADC_PIN_PRIMARY = 2;
 constexpr int BATTERY_ADC_PIN_ALT = 8;
 constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // voltage divider halves battery voltage
 constexpr float BATTERY_MIN_V = 3.3f;
-constexpr float BATTERY_MAX_V = 4.2f;
+constexpr float BATTERY_MAX_V = 4.0f;
 
 constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
 
