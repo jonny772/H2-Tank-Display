@@ -29,7 +29,7 @@ constexpr char THING_ID[] = "9ff4611c-bd42-4c69-86b4-9245cfb82037";
 constexpr char PROPERTY_ID[] = "26ac0e3f-49cf-484d-9f08-ca02a8c49698";
 
 // Pressure scaling
-constexpr float MAX_BAR_VALUE = 12.0f;  // 100%
+constexpr float MAX_BAR_VALUE = 1.5f;  // 100%
 
 // Battery monitor pins (board variants show BAT_VOLT on GPIO2; some defs use GPIO8). Read both.
 constexpr int BATTERY_ADC_PIN_PRIMARY = 2;
@@ -99,6 +99,7 @@ const unsigned long dataFetchIntervalMs = 30000;  // 30s polling
 unsigned long lastDataFetchMs = 0;
 unsigned long lastStatusDrawMs = 0;
 const unsigned long statusDrawIntervalMs = 2000;  // redraw top bar every 2 seconds
+const unsigned long criticalBlinkIntervalMs = 500;  // bar blink cadence for <10%
 unsigned long lastWifiTapMs = 0;
 const unsigned long doubleTapWindowMs = 500;  // ms between taps to open WiFi
 constexpr bool SERIAL_VERBOSE = false;
@@ -113,6 +114,7 @@ float batteryAvgVoltage = 0.0f;
 float cachedBatteryPercent = 0.0f;
 unsigned long lastWifiAttemptMs = 0;
 const unsigned long wifiReconnectIntervalMs = 15000;
+unsigned long lastBarBlinkMs = 0;
 
 struct TouchEvent {
   int16_t x;
@@ -298,6 +300,16 @@ void loop() {
       accessToken = "";
       tokenExpiresAt = 0;
       connectWiFi();
+    }
+  }
+
+  // Force redraws when in critical range so the bar actually flashes.
+  float percent = (lastPressureReading / MAX_BAR_VALUE) * 100.0f;
+  if (percent < 10.0f) {
+    unsigned long nowBlink = millis();
+    if (nowBlink - lastBarBlinkMs >= criticalBlinkIntervalMs) {
+      lastBarBlinkMs = nowBlink;
+      drawBar(lastPressureReading);
     }
   }
 
