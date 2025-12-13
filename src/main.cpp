@@ -6,11 +6,15 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <vector>
+#include <algorithm>
 
-// Wi-Fi credentials
+// Wi-Fi credentials - ONLY 1 DEFAULT OTHERS ADDED BY UI. Will persist across flashes
 constexpr char WIFI_SSID[] = "LUinc-Members";
 constexpr char WIFI_PASSWORD[] = "eFGEpC-uH2";
+//constexpr char WIFI_SSID[] = "iPhone";
+//constexpr char WIFI_PASSWORD[] = "tttttttt";
 
 // Arduino Cloud OAuth2 credentials
 constexpr char CLIENT_ID[] = "TMi3JA5FjHcMhz1Ib2pzrg9uZRTpYMoM";
@@ -27,8 +31,10 @@ constexpr char PROPERTY_ID[] = "26ac0e3f-49cf-484d-9f08-ca02a8c49698";
 // Pressure scaling
 constexpr float MAX_BAR_VALUE = 1.5f;  // 100%
 
-// Battery monitor
-constexpr int BATTERY_ADC_PIN = 4;
+// Battery monitor pins (board variants show BAT_VOLT on GPIO2; some defs use GPIO8). Read both.
+constexpr int BATTERY_ADC_PIN_PRIMARY = 2;
+constexpr int BATTERY_ADC_PIN_ALT = 8;
+constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // voltage divider halves battery voltage
 constexpr float BATTERY_MIN_V = 3.3f;
 constexpr float BATTERY_MAX_V = 4.2f;
 
@@ -37,6 +43,9 @@ constexpr uint16_t COLOR_BLACK = RGB565_BLACK;
 constexpr uint16_t COLOR_WHITE = RGB565_WHITE;
 constexpr uint16_t COLOR_GREEN = RGB565_GREEN;
 constexpr uint16_t COLOR_YELLOW = RGB565_YELLOW;
+constexpr uint16_t COLOR_DARKGREY = RGB565_NAVY;
+constexpr uint16_t COLOR_LIGHTBLUE = RGB565_CYAN;
+constexpr uint16_t COLOR_RED = RGB565_RED;
 
 // Display pins for LilyGO T-Display S3 Long
 constexpr int TFT_QSPI_CS = 12;
@@ -49,6 +58,20 @@ constexpr int TFT_QSPI_RST = 16;
 constexpr int TFT_BL = 1;
 
 constexpr uint8_t BACKLIGHT_PWM_CHANNEL = 1;
+
+// Touch (AXS15231B) pins
+constexpr int TOUCH_IICSCL = 10;
+constexpr int TOUCH_IICSDA = 15;
+constexpr int TOUCH_INT = 11;
+constexpr int TOUCH_RES = 16;
+
+// Touch controller
+constexpr uint8_t TOUCH_ADDR = 0x3B;
+constexpr uint8_t TOUCH_CMD[] = {0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00};
+volatile bool g_touchInterrupt = false;
+unsigned long nextTouchPollMs = 0;
+uint8_t lastTouchBuf[8] = {0};
+bool loggedTouchPresence = false;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     TFT_QSPI_CS, TFT_QSPI_SCK, TFT_QSPI_D0, TFT_QSPI_D1, TFT_QSPI_D2, TFT_QSPI_D3);
@@ -70,6 +93,32 @@ unsigned long tokenExpiresAt = 0;  // millis when token expires
 int16_t lastTouchX = -1;
 int16_t lastTouchY = -1;
 float lastPressureReading = 0.0f;
+const unsigned long dataFetchIntervalMs = 30000;  // 30s polling
+unsigned long lastDataFetchMs = 0;
+unsigned long lastStatusDrawMs = 0;
+const unsigned long statusDrawIntervalMs = 2000;  // redraw top bar every 2 seconds
+unsigned long lastWifiTapMs = 0;
+const unsigned long doubleTapWindowMs = 500;  // ms between taps to open WiFi
+constexpr bool SERIAL_VERBOSE = false;
+bool wifiSettingsActive = false;
+size_t lastWorkingNetworkIndex = 0;
+bool hasLastWorkingNetwork = false;
+bool awaitingNewNetworkToken = false;
+unsigned long newNetworkStartMs = 0;
+unsigned long lastBatterySampleMs = 0;
+const unsigned long batterySampleIntervalMs = 2000;  // read battery every 2s
+float batteryAvgVoltage = 0.0f;
+unsigned long lastWifiAttemptMs = 0;
+const unsigned long wifiReconnectIntervalMs = 15000;
+
+struct TouchEvent {
+  int16_t x;
+  int16_t y;
+  uint8_t fingers;
+  uint8_t event;
+};
+
+QueueHandle_t touchQueue = nullptr;
 
 void connectWiFi();
 bool refreshAccessToken();
@@ -78,17 +127,26 @@ void drawScaffold();
 void drawBar(float valueBar);
 void showStatus(const String &msg);
 void drawStatusIcons();
+void handleSerialCommands();
 float readBatteryPercent();
 int wifiBars();
 bool hasInternetConnectivity();
 void loadSavedNetworks();
 void saveNetworks();
 void ensureNetwork(const String &ssid, const String &password);
+int findNetworkIndex(const String &ssid);
 bool readTouch(int16_t &x, int16_t &y);
+bool readTouch(int16_t &x, int16_t &y, uint8_t &fingers, uint8_t &touchEvent);
 bool isWifiIconTouched(int16_t x, int16_t y);
 void openWiFiSettings();
-int selectNetworkFromList(int networkCount, int startY, int rowHeight);
+int selectNetworkFromList(const std::vector<String> &ssids, int startY, int rowHeight);
 String promptForPassword(const String &ssid);
+std::vector<String> scanUniqueNetworks();
+void drawNetworkList(const std::vector<String> &ssids, int startIndex, int startY, int rowHeight, int visibleRows);
+void clearTouchQueue();
+void scanI2CBus();
+void printBuf(const uint8_t *buf, size_t len);
+void touchTask(void *param);
 
 void setup() {
   Serial.begin(115200);
@@ -99,7 +157,29 @@ void setup() {
   ledcSetup(BACKLIGHT_PWM_CHANNEL, 2000, 8);
   ledcWrite(BACKLIGHT_PWM_CHANNEL, 0);  // keep off until the panel is ready
 
-  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  analogSetPinAttenuation(BATTERY_ADC_PIN_PRIMARY, ADC_11db);
+  analogSetPinAttenuation(BATTERY_ADC_PIN_ALT, ADC_11db);
+
+  // Touch
+  pinMode(TOUCH_RES, OUTPUT);
+  pinMode(TOUCH_INT, INPUT_PULLUP);
+  attachInterrupt(TOUCH_INT, [] { g_touchInterrupt = true; }, FALLING);
+
+  // Reset touch controller (AXS15231B sequence from LilyGO example)
+  digitalWrite(TOUCH_RES, HIGH);
+  delay(2);
+  digitalWrite(TOUCH_RES, LOW);
+  delay(100);
+  digitalWrite(TOUCH_RES, HIGH);
+  delay(2);
+
+  Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL, 400000);
+  // Quick scan to confirm touch is present on the expected address.
+  Wire.beginTransmission(TOUCH_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Touch controller not detected on 0x3B");
+  }
+  scanI2CBus();
 
   gfx->begin();
   screenW = gfx->width();
@@ -119,8 +199,16 @@ void setup() {
   drawStatusIcons();
 
   secureClient.setInsecure();
-  showStatus("Auth...");
-  refreshAccessToken();
+  if (WiFi.status() == WL_CONNECTED) {
+    showStatus("Auth...");
+    refreshAccessToken();
+  } else {
+    showStatus("No WiFi");
+  }
+
+  // Spawn touch task on core 0 to keep UI loop responsive on core 1.
+  touchQueue = xQueueCreate(8, sizeof(TouchEvent));
+  xTaskCreatePinnedToCore(touchTask, "touchTask", 4096, nullptr, 1, nullptr, 0);
 
   // Fade backlight up
   for (int i = 0; i <= 255; i += 8) {
@@ -130,21 +218,37 @@ void setup() {
 }
 
 void loop() {
-  int16_t tx, ty;
-  if (readTouch(tx, ty)) {
-    lastTouchX = tx;
-    lastTouchY = ty;
-    if (isWifiIconTouched(tx, ty)) {
-      openWiFiSettings();
+  TouchEvent evt;
+  while (touchQueue && xQueueReceive(touchQueue, &evt, 0) == pdTRUE) {
+    lastTouchX = evt.x;
+    lastTouchY = evt.y;
+    bool inWifiIcon = isWifiIconTouched(evt.x, evt.y);
+    // Double-tap on Wi-Fi icon to open settings.
+    if (inWifiIcon && (evt.event == 0 || evt.event == 1)) {  // down or up counts as a tap
+      unsigned long now = millis();
+      if (now - lastWifiTapMs <= doubleTapWindowMs) {
+        openWiFiSettings();
+        lastWifiTapMs = 0;
+      } else {
+        lastWifiTapMs = now;
+      }
     }
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    showStatus("Reconnect WiFi");
-    connectWiFi();
+  handleSerialCommands();
+
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+
+  if (!wifiOk) {
+    unsigned long now = millis();
+    if (!wifiSettingsActive && (now - lastWifiAttemptMs > wifiReconnectIntervalMs)) {
+      showStatus("Reconnect WiFi");
+      lastWifiAttemptMs = now;
+      connectWiFi();
+    }
   }
 
-  if (millis() - lastConnectivityCheck > connectivityIntervalMs) {
+  if (wifiOk && millis() - lastConnectivityCheck > connectivityIntervalMs) {
     lastConnectivityCheck = millis();
     if (!hasInternetConnectivity() && !knownNetworks.empty()) {
       showStatus("Find internet");
@@ -153,7 +257,7 @@ void loop() {
     }
   }
 
-  if (millis() > tokenExpiresAt) {
+  if (wifiOk && millis() > tokenExpiresAt) {
     showStatus("Refresh token");
     if (!refreshAccessToken()) {
       delay(5000);
@@ -161,20 +265,49 @@ void loop() {
     }
   }
 
-  float pressure = fetchPressure();
-  if (pressure >= 0.0f) {
-    lastPressureReading = pressure;
-    drawBar(pressure);
+  if (wifiOk && millis() - lastDataFetchMs >= dataFetchIntervalMs) {
+    lastDataFetchMs = millis();
+    float pressure = fetchPressure();
+    if (pressure >= 0.0f) {
+      lastPressureReading = pressure;
+      drawBar(pressure);
+    }
   }
 
-  drawStatusIcons();
-  delay(5000);
+  unsigned long now = millis();
+  if (now - lastStatusDrawMs >= statusDrawIntervalMs) {
+    lastStatusDrawMs = now;
+    if (now - lastBatterySampleMs >= batterySampleIntervalMs) {
+      // Touch battery only when we are about to draw status to keep load low.
+      readBatteryPercent();
+      lastBatterySampleMs = now;
+    }
+    drawStatusIcons();
+  }
+
+  // If we tried a new network and failed to get a token within 60s, revert to last working.
+  if (awaitingNewNetworkToken && (millis() - newNetworkStartMs > 60000)) {
+    awaitingNewNetworkToken = false;
+    if (hasLastWorkingNetwork && lastWorkingNetworkIndex < knownNetworks.size()) {
+      currentNetworkIndex = lastWorkingNetworkIndex;
+      showStatus("Revert WiFi");
+      accessToken = "";
+      tokenExpiresAt = 0;
+      connectWiFi();
+    }
+  }
+
+  delay(10);
 }
 
 void connectWiFi() {
   if (knownNetworks.empty()) {
     ensureNetwork(WIFI_SSID, WIFI_PASSWORD);
   }
+  lastWifiAttemptMs = millis();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
 
   for (size_t i = 0; i < knownNetworks.size(); i++) {
     size_t attemptIndex = (currentNetworkIndex + i) % knownNetworks.size();
@@ -184,8 +317,9 @@ void connectWiFi() {
     showStatus(String("Join ") + cred.first);
     WiFi.begin(cred.first.c_str(), cred.second.c_str());
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 60) {
-      delay(250);
+    const int maxAttempts = 40;  // ~6s per network for more reliable association
+    while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+      delay(150);
       attempts++;
     }
 
@@ -237,6 +371,9 @@ bool refreshAccessToken() {
   int expiresIn = doc["expires_in"].as<int>();
   tokenExpiresAt = millis() + (expiresIn - 30) * 1000UL;  // refresh 30s early
   showStatus("Token OK");
+  hasLastWorkingNetwork = true;
+  lastWorkingNetworkIndex = currentNetworkIndex;
+  awaitingNewNetworkToken = false;
 
   http.end();
   return true;
@@ -319,10 +456,13 @@ void drawScaffold() {
 }
 
 void drawBar(float valueBar) {
-  int barTop = 130;
-  int barHeight = 120;
-  int barLeft = 10;
+  // Vertical bar with comfortable side margins to avoid edge artifacts
+  int barTop = 120;
+  int barHeight = screenH - barTop - 60;
+  int barLeft = 12;
   int barWidth = screenW - (barLeft * 2);
+  if (barHeight < 40) barHeight = 40;
+  if (barWidth < 20) barWidth = 20;
 
   float clamped = valueBar;
   if (clamped < 0.0f) clamped = 0.0f;
@@ -332,16 +472,36 @@ void drawBar(float valueBar) {
   if (percent < 0.0f) percent = 0.0f;
   if (percent > 100.0f) percent = 100.0f;
 
-  int filled = static_cast<int>(barWidth * (percent / 100.0f));
+  int filled = static_cast<int>(barHeight * (percent / 100.0f));
 
-  gfx->fillRect(barLeft, barTop, barWidth, barHeight, COLOR_BLACK);
-  gfx->drawRoundRect(barLeft, barTop, barWidth, barHeight, 8, COLOR_WHITE);
-  if (filled > 0) {
-    gfx->fillRoundRect(barLeft, barTop, filled, barHeight, 8, COLOR_GREEN);
+  // Choose color based on level and blink if critical
+  bool criticalBlink = percent < 10.0f;
+  bool blinkOn = ((millis() / 500) % 2) == 0;  // 1Hz blink
+  uint16_t fillColor = (percent < 20.0f) ? COLOR_RED : COLOR_LIGHTBLUE;
+  if (criticalBlink && !blinkOn) {
+    fillColor = COLOR_BLACK;
   }
 
-  gfx->fillRect(0, barTop + barHeight + 10, screenW, 60, COLOR_BLACK);
-  gfx->setCursor(barLeft, barTop + barHeight + 20);
+  // Clear full gauge band to prevent edge pixelation from prior draws
+  gfx->fillRect(0, barTop, screenW, barHeight, COLOR_BLACK);
+
+  gfx->drawRect(barLeft, barTop, barWidth, barHeight, COLOR_WHITE);
+  // Graduations at 0%, 25%, 50%, 75%, 100%
+  for (int i = 0; i <= 4; i++) {
+    int y = barTop + (barHeight * i) / 4;
+    gfx->drawFastHLine(barLeft - 4, y, 6, COLOR_WHITE);
+    gfx->drawFastHLine(barLeft + barWidth - 2, y, 6, COLOR_WHITE);
+  }
+  gfx->drawRect(barLeft, barTop, barWidth, barHeight, COLOR_WHITE);
+  if (filled > 0) {
+    int fillTop = barTop + (barHeight - filled);
+    gfx->fillRect(barLeft + 1, fillTop + 1, barWidth - 2, filled - 2, fillColor);
+    // Sharp transition line at fill top
+    gfx->drawFastHLine(barLeft + 1, fillTop, barWidth - 2, COLOR_WHITE);
+  }
+
+  gfx->fillRect(0, barTop - 40, screenW, 30, COLOR_BLACK);
+  gfx->setCursor(barLeft, barTop - 36);
   gfx->setTextSize(3);
   gfx->printf("%.0f%%", percent);
   gfx->setTextSize(2);
@@ -383,10 +543,30 @@ void drawStatusIcons() {
 }
 
 float readBatteryPercent() {
-  uint16_t millivolts = analogReadMilliVolts(BATTERY_ADC_PIN);
-  float voltage = millivolts / 1000.0f;
-  float percent = ((voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) *
-                  100.0f;
+  auto readMv = [](int pin) -> uint16_t {
+    if (pin < 0) return 0;
+    return analogReadMilliVolts(pin);
+  };
+
+  uint16_t mvPrimary = readMv(BATTERY_ADC_PIN_PRIMARY);
+  uint16_t mvAlt = readMv(BATTERY_ADC_PIN_ALT);
+  uint16_t millivolts = mvPrimary;
+  if (millivolts == 0 && mvAlt > 0) {
+    millivolts = mvAlt;
+  } else if (mvAlt > millivolts) {
+    millivolts = mvAlt;
+  }
+
+  float voltage = (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
+  // Rolling average over ~20s (sampled every ~2s) for smoother display
+  if (batteryAvgVoltage <= 0.01f) {
+    batteryAvgVoltage = voltage;
+  } else {
+    // Simple low-pass filter (alpha ~0.2)
+    batteryAvgVoltage = (batteryAvgVoltage * 0.8f) + (voltage * 0.2f);
+  }
+  float vForPercent = batteryAvgVoltage;
+  float percent = ((voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) * 100.0f;
   if (percent < 0.0f) percent = 0.0f;
   if (percent > 100.0f) percent = 100.0f;
   return percent;
@@ -443,6 +623,9 @@ void saveNetworks() {
 void ensureNetwork(const String &ssid, const String &password) {
   for (const auto &net : knownNetworks) {
     if (net.first == ssid) {
+      // Update existing password if changed
+      const_cast<String &>(net.second) = password;
+      saveNetworks();
       return;
     }
   }
@@ -450,107 +633,291 @@ void ensureNetwork(const String &ssid, const String &password) {
   saveNetworks();
 }
 
-bool readTouch(int16_t &x, int16_t &y) {
-#ifdef TOUCH_INT
-  // If a touch driver is wired, poll it here. Placeholder for integration.
-  return false;
-#else
-  if (Serial.available()) {
-    char command = Serial.peek();
-    if (command == 'w' || command == 'W') {
-      Serial.read();
-      x = 0;
-      y = 0;
-      return true;
+int findNetworkIndex(const String &ssid) {
+  for (size_t i = 0; i < knownNetworks.size(); i++) {
+    if (knownNetworks[i].first == ssid) {
+      return static_cast<int>(i);
     }
   }
-  (void)x;
-  (void)y;
-  return false;
-#endif
+  return -1;
+}
+
+bool readTouch(int16_t &x, int16_t &y) {
+  uint8_t fingers = 0, evt = 0;
+  return readTouch(x, y, fingers, evt);
+}
+
+bool readTouch(int16_t &x, int16_t &y, uint8_t &fingers, uint8_t &touchEvent) {
+  // Poll the AXS15231B over I2C, triggered by INT falling edge or a periodic poll.
+  bool shouldPoll = g_touchInterrupt || millis() >= nextTouchPollMs;
+  if (!shouldPoll) return false;
+
+  g_touchInterrupt = false;
+  nextTouchPollMs = millis() + 10;  // faster poll for responsiveness
+
+  // Write touch read command
+  Wire.beginTransmission(TOUCH_ADDR);
+  Wire.write(TOUCH_CMD, sizeof(TOUCH_CMD));
+  // Keep bus active for a repeated start into the read phase.
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  // Read 8-byte touch status payload
+  constexpr uint8_t READ_LEN = 8;
+  uint8_t buf[READ_LEN] = {0};
+  int readCount = Wire.requestFrom(static_cast<int>(TOUCH_ADDR), static_cast<int>(READ_LEN), static_cast<int>(true));
+  if (readCount != READ_LEN) {
+    if (SERIAL_VERBOSE && Serial && (millis() % 1000 < 50)) {
+      Serial.printf("Touch read short: %d/8\n", readCount);
+    }
+    return false;
+  }
+  for (int i = 0; i < READ_LEN; i++) {
+    buf[i] = Wire.read();
+  }
+
+  // Decode using LilyGO macros (event in bits 7-6 of buf[2]).
+  // In their reference, X comes from buf[4]/buf[5], Y from buf[2]/buf[3], and Y is inverted vs. panel height.
+  fingers = buf[1];  // use full byte; some frames set high nibble
+  touchEvent = buf[2] >> 6;  // 0: down, 1: up, 2: contact/move (chip may report other codes; we don't filter hard)
+  uint16_t rawX = static_cast<uint16_t>((buf[4] & 0x0F) << 8) | buf[5];
+  uint16_t rawY = static_cast<uint16_t>((buf[2] & 0x0F) << 8) | buf[3];
+
+  // Require at least one finger; don't aggressively drop other frames (some chips send varied patterns).
+  if (fingers == 0) {
+    return false;
+  }
+
+  // Panel is 180 (W) x 640 (H); incoming coords are 0..179 (X) and 0..639 (Y), Y inverted.
+  x = static_cast<int16_t>(rawX);
+  y = static_cast<int16_t>(640 - rawY);
+  // Clamp to screen bounds.
+  if (x < 0) x = 0;
+  if (x >= screenW) x = screenW - 1;
+  if (y < 0) y = 0;
+  if (y >= screenH) y = screenH - 1;
+
+  if (SERIAL_VERBOSE) {
+    Serial.printf("Touch fingers=%u event=%u rawX=%u rawY=%u -> x=%d y=%d\n", fingers, touchEvent, rawX, rawY, x, y);
+  }
+  return true;
 }
 
 bool isWifiIconTouched(int16_t x, int16_t y) {
-  int iconWidth = 28;
-  int iconHeight = 26;
+  // Larger target for easier taps/presses.
+  int iconWidth = 64;
+  int iconHeight = 48;
   return (x >= 0 && x <= iconWidth && y >= 0 && y <= iconHeight);
 }
 
 void openWiFiSettings() {
+  wifiSettingsActive = true;
   gfx->fillScreen(COLOR_BLACK);
+  gfx->setTextSize(2);
   gfx->setCursor(10, 10);
   gfx->print("WiFi Settings");
 
-  gfx->setCursor(10, 34);
+  gfx->setCursor(10, 40);
   gfx->print("Scanning...");
-  int networkCount = WiFi.scanNetworks();
   gfx->fillRect(0, 30, screenW, screenH - 30, COLOR_BLACK);
 
-  if (networkCount <= 0) {
+  std::vector<String> ssids = scanUniqueNetworks();
+
+  if (ssids.empty()) {
     gfx->setCursor(10, 50);
     gfx->print("No networks found");
     delay(1500);
+    wifiSettingsActive = false;
     drawScaffold();
     return;
   }
 
-  int startY = 40;
-  int rowHeight = 26;
-  for (int i = 0; i < networkCount && (startY + (i * rowHeight)) < screenH - 30; i++) {
-    gfx->setCursor(10, startY + (i * rowHeight));
-    gfx->printf("%d: %s", i + 1, WiFi.SSID(i).c_str());
-  }
+  int startY = 60;
+  int rowHeight = 44;
+  int visibleRows = (screenH - startY - 80) / rowHeight;
+  if (visibleRows < 1) visibleRows = 1;
+  gfx->setTextSize(3);
+  drawNetworkList(ssids, 0, startY, rowHeight, visibleRows);
 
+  gfx->setTextSize(2);
   gfx->setCursor(10, screenH - 30);
-  gfx->print("Tap a network");
+  gfx->print("Tap a network (use arrows)");
 
-  int choice = selectNetworkFromList(networkCount, startY, rowHeight);
-  if (choice < 0 || choice >= networkCount) {
+  clearTouchQueue();
+  int choice = selectNetworkFromList(ssids, startY, rowHeight);
+  if (choice < 0 || choice >= static_cast<int>(ssids.size())) {
+    wifiSettingsActive = false;
     drawScaffold();
     return;
   }
 
-  String chosenSsid = WiFi.SSID(choice);
+  String chosenSsid = ssids[choice];
+  clearTouchQueue();
   String password = promptForPassword(chosenSsid);
   ensureNetwork(chosenSsid, password);
-  currentNetworkIndex = 0;
+  int newIndex = findNetworkIndex(chosenSsid);
+  if (newIndex >= 0) {
+    currentNetworkIndex = static_cast<size_t>(newIndex);
+  }
+  awaitingNewNetworkToken = true;
+  newNetworkStartMs = millis();
+  accessToken = "";
+  tokenExpiresAt = 0;
   connectWiFi();
   drawScaffold();
+  wifiSettingsActive = false;
 }
 
-int selectNetworkFromList(int networkCount, int startY, int rowHeight) {
-  unsigned long timeout = millis() + 15000;
+int selectNetworkFromList(const std::vector<String> &ssids, int startY, int rowHeight) {
+  int total = static_cast<int>(ssids.size());
+  if (total == 0) return -1;
+
+  int visibleRows = (screenH - startY - 80) / rowHeight;
+  if (visibleRows < 1) visibleRows = 1;
+  int startIndex = 0;
+  unsigned long timeout = millis() + 20000;
+
+  drawNetworkList(ssids, startIndex, startY, rowHeight, visibleRows);
+
   while (millis() < timeout) {
-    int16_t x, y;
-    if (readTouch(x, y)) {
-      int index = (y - startY) / rowHeight;
-      if (index >= 0 && index < networkCount) {
-        return index;
+    TouchEvent evt;
+    if (touchQueue && xQueueReceive(touchQueue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+      // Up arrow area
+      if (evt.y >= 20 && evt.y < startY - 10) {
+        if (startIndex > 0) {
+          startIndex--;
+          drawNetworkList(ssids, startIndex, startY, rowHeight, visibleRows);
+        }
+        continue;
+      }
+      // Down arrow area
+      if (evt.y > screenH - 60) {
+        if (startIndex + visibleRows < total) {
+          startIndex++;
+          drawNetworkList(ssids, startIndex, startY, rowHeight, visibleRows);
+        }
+        continue;
+      }
+      // Row hit
+      if (evt.y >= startY && evt.y < startY + visibleRows * rowHeight) {
+        int index = startIndex + (evt.y - startY) / rowHeight;
+        if (index >= 0 && index < total) {
+          return index;
+        }
       }
     }
-    delay(50);
   }
   return -1;
 }
 
 String promptForPassword(const String &ssid) {
-  gfx->fillRect(0, 30, screenW, screenH - 30, COLOR_BLACK);
-  gfx->setCursor(10, 40);
-  gfx->printf("Enter password for %s\n", ssid.c_str());
-  gfx->setCursor(10, 68);
-  gfx->print("Send via Serial");
-
+  static const char charset[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*-_+=.? ";
+  const int charsetLen = sizeof(charset) - 1;
+  int charIndex = 0;
   String password;
-  unsigned long timeout = millis() + 30000;
-  while (millis() < timeout) {
-    if (Serial.available()) {
-      password = Serial.readStringUntil('\n');
-      password.trim();
-      break;
-    }
-    delay(50);
-  }
 
+  clearTouchQueue();
+  unsigned long entryMs = millis();
+
+  auto redraw = [&](const String &pwd, char current) {
+    gfx->fillRect(0, 30, screenW, screenH - 30, COLOR_BLACK);
+    gfx->setTextSize(2);
+    gfx->setCursor(10, 40);
+    gfx->printf("Password for:\n%s", ssid.c_str());
+    gfx->setCursor(10, 90);
+    gfx->print("Current:");
+    gfx->setCursor(10, 120);
+    gfx->setTextSize(3);
+    String display = pwd;
+    if (display.length() > 12) {
+      display = String("...") + display.substring(display.length() - 12);
+    }
+    gfx->print(display);
+
+    // Spinner
+    int spinnerY = 220;
+    gfx->setTextSize(6);
+    gfx->setCursor((screenW / 2) - 20, spinnerY - 90);
+    gfx->print("^");
+    gfx->setCursor((screenW / 2) - 20, spinnerY);
+    gfx->printf("%c", current);
+    gfx->setCursor((screenW / 2) - 20, spinnerY + 90);
+    gfx->print("v");
+
+    // Buttons layout:
+    // Add (full width) near top of control area
+    // Bottom: Done, then Back, gap, then Cancel (full width bars)
+    gfx->setTextSize(3);
+    int addH = 70;
+    int addTopY = screenH - 260;
+    if (addTopY < 140) addTopY = 140;  // keep below header text
+    gfx->fillRect(0, addTopY, screenW, addH, COLOR_BLACK);
+    gfx->setCursor((screenW / 2) - 30, addTopY + 20);
+    gfx->print("Add");
+
+    int rowH = 70;
+    int doneY = screenH - 3 * rowH;   // Done
+    int backY = screenH - 2 * rowH;   // Back
+    int cancelY = screenH - rowH;     // Cancel (gap appears automatically above it)
+    gfx->fillRect(0, doneY, screenW, rowH, COLOR_BLACK);
+    gfx->fillRect(0, backY, screenW, rowH, COLOR_BLACK);
+    gfx->fillRect(0, cancelY, screenW, rowH, COLOR_BLACK);
+
+    gfx->setCursor(10, doneY + 20);
+    gfx->print("Done");
+    gfx->setCursor(10, backY + 20);
+    gfx->print("Back");
+    gfx->setCursor(10, cancelY + 20);
+    gfx->print("Cancel");
+  };
+
+  redraw(password, charset[charIndex]);
+
+  // Wait until user completes or cancels; no timeout.
+  while (true) {
+    TouchEvent evt;
+    if (touchQueue && xQueueReceive(touchQueue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+      // Ignore any early events within 300ms of entry to avoid stale taps.
+      if (millis() - entryMs < 300) continue;
+      // Only act on down/up events.
+      if (!(evt.event == 0 || evt.event == 1)) continue;
+
+      // Spinner up
+      if (evt.y >= 80 && evt.y < 220) {
+        charIndex = (charIndex - 1 + charsetLen) % charsetLen;
+        redraw(password, charset[charIndex]);
+        continue;
+      }
+      // Spinner down
+      if (evt.y >= 240 && evt.y < 380) {
+        charIndex = (charIndex + 1) % charsetLen;
+        redraw(password, charset[charIndex]);
+        continue;
+      }
+      // Buttons hit zones
+      int addTopY = screenH - 260;
+      int addH = 70;
+      if (addTopY < 140) addTopY = 140;
+      int rowH = 70;
+      int doneY = screenH - 3 * rowH;
+      int backY = screenH - 2 * rowH;
+      int cancelY = screenH - rowH;
+
+      if (evt.y >= addTopY && evt.y < addTopY + addH) {
+        password += charset[charIndex];
+        redraw(password, charset[charIndex]);
+      } else if (evt.y >= doneY && evt.y < doneY + rowH) {
+        return password;  // Done
+      } else if (evt.y >= backY && evt.y < backY + rowH) {
+        if (password.length() > 0) password.remove(password.length() - 1);
+        redraw(password, charset[charIndex]);
+      } else if (evt.y >= cancelY && evt.y < cancelY + rowH) {
+        return "";
+      }
+    }
+  }
   return password;
 }
 
@@ -560,5 +927,150 @@ void showStatus(const String &msg) {
   gfx->setTextColor(COLOR_YELLOW, COLOR_BLACK);
   gfx->print(msg);
   gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
-  Serial.println(msg);
+  if (SERIAL_VERBOSE) {
+    Serial.println(msg);
+  }
+}
+
+std::vector<String> scanUniqueNetworks() {
+  std::vector<String> ssids;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  WiFi.setSleep(false);
+  delay(200);
+
+  int count = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+  if (count <= 0) {
+    delay(700);
+    count = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+  }
+
+  for (int i = 0; i < count; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() == 0) continue;
+    bool exists = false;
+    for (const auto &t : ssids) {
+      if (t == s) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) ssids.push_back(s);
+  }
+  return ssids;
+}
+
+void drawNetworkList(const std::vector<String> &ssids, int startIndex, int startY, int rowHeight, int visibleRows) {
+  int listHeight = visibleRows * rowHeight;
+  if (listHeight < 0) listHeight = 0;
+  int areaHeight = listHeight + 60;
+  gfx->fillRect(0, startY - 30, screenW, areaHeight + 40, COLOR_BLACK);
+
+  gfx->setTextSize(2);
+  // Up/down arrows
+  gfx->setCursor((screenW / 2) - 6, startY - 24);
+  gfx->print("^");
+  gfx->setCursor((screenW / 2) - 6, screenH - 40);
+  gfx->print("v");
+
+  gfx->setTextSize(3);
+  for (int i = 0; i < visibleRows; i++) {
+    int idx = startIndex + i;
+    if (idx >= static_cast<int>(ssids.size())) break;
+    gfx->setCursor(8, startY + (i * rowHeight));
+    gfx->printf("%d: %s", idx + 1, ssids[idx].c_str());
+  }
+
+  gfx->setTextSize(1);
+  gfx->setCursor(8, screenH - 20);
+  gfx->printf("Showing %d-%d of %d", startIndex + 1,
+              min(startIndex + visibleRows, static_cast<int>(ssids.size())),
+              static_cast<int>(ssids.size()));
+}
+
+void scanI2CBus() {
+  Serial.println("I2C scan:");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.printf(" - Found 0x%02X\n", addr);
+    }
+  }
+}
+
+void printBuf(const uint8_t *buf, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    Serial.printf(" %02X", buf[i]);
+  }
+  Serial.println();
+}
+
+void touchTask(void *param) {
+  const TickType_t idleDelay = pdMS_TO_TICKS(5);
+  TouchEvent evt{};
+  for (;;) {
+    int16_t x, y;
+    uint8_t fingers = 0, ev = 0;
+    bool got = readTouch(x, y, fingers, ev);
+    if (got) {
+      evt.x = x;
+      evt.y = y;
+      evt.fingers = fingers;
+      evt.event = ev;
+      if (touchQueue) {
+        if (xQueueSend(touchQueue, &evt, 0) != pdPASS) {
+          xQueueReset(touchQueue);
+          xQueueSend(touchQueue, &evt, 0);
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(2));
+    } else {
+      vTaskDelay(idleDelay);
+    }
+  }
+}
+
+void clearTouchQueue() {
+  if (!touchQueue) return;
+  TouchEvent evt;
+  while (xQueueReceive(touchQueue, &evt, 0) == pdTRUE) {
+  }
+}
+
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'W' || c == 'w') {
+      Serial.println("WiFi networks (id: ssid / password):");
+      for (size_t i = 0; i < knownNetworks.size(); i++) {
+        Serial.printf("%u: %s / %s\n", static_cast<unsigned>(i), knownNetworks[i].first.c_str(),
+                      knownNetworks[i].second.c_str());
+      }
+      if (knownNetworks.empty()) {
+        Serial.println("(none)");
+      }
+    } else if (c == 'D' || c == 'd') {
+      // Parse the rest of the line as an index
+      String num = Serial.readStringUntil('\n');
+      num.trim();
+      int idx = num.toInt();
+      if (idx >= 0 && idx < static_cast<int>(knownNetworks.size())) {
+        Serial.printf("Deleting WiFi id %d (%s)\n", idx, knownNetworks[idx].first.c_str());
+        knownNetworks.erase(knownNetworks.begin() + idx);
+        // Adjust current/last working indices if needed
+        if (currentNetworkIndex >= knownNetworks.size()) {
+          currentNetworkIndex = 0;
+        }
+        if (hasLastWorkingNetwork && lastWorkingNetworkIndex >= knownNetworks.size()) {
+          hasLastWorkingNetwork = false;
+          lastWorkingNetworkIndex = 0;
+        }
+        saveNetworks();
+      } else {
+        Serial.printf("Invalid delete id: %s\n", num.c_str());
+      }
+    }
+  }
 }
