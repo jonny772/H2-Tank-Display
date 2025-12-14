@@ -9,6 +9,7 @@
 #include <Wire.h>
 #include <vector>
 #include <algorithm>
+#include <iterator>
 
 // Wi-Fi credentials - ONLY 1 DEFAULT OTHERS ADDED BY UI. Will persist across flashes
 constexpr char WIFI_SSID[] = "LUinc-Members";
@@ -31,9 +32,8 @@ constexpr char PROPERTY_ID[] = "26ac0e3f-49cf-484d-9f08-ca02a8c49698";
 // Pressure scaling
 constexpr float MAX_BAR_VALUE = 1.5f;  // 100%
 
-// Battery monitor pins (board variants show BAT_VOLT on GPIO2; some defs use GPIO8). Read both.
+// Battery monitor pin
 constexpr int BATTERY_ADC_PIN_PRIMARY = 2;
-constexpr int BATTERY_ADC_PIN_ALT = 8;
 constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // voltage divider halves battery voltage
 constexpr float BATTERY_MIN_V = 3.3f;
 constexpr float BATTERY_MAX_V = 4.0f;
@@ -98,8 +98,11 @@ float lastPressureReading = 0.0f;
 const unsigned long dataFetchIntervalMs = 30000;  // 30s polling
 unsigned long lastDataFetchMs = 0;
 unsigned long lastStatusDrawMs = 0;
+unsigned long lastDataUpdateMs = 0;
+bool lastDataStale = false;
 const unsigned long statusDrawIntervalMs = 2000;  // redraw top bar every 2 seconds
 const unsigned long criticalBlinkIntervalMs = 500;  // bar blink cadence for <10%
+const unsigned long dataStaleIntervalMs = 5UL * 60UL * 1000UL;  // 5 minutes
 unsigned long lastWifiTapMs = 0;
 const unsigned long doubleTapWindowMs = 500;  // ms between taps to open WiFi
 constexpr bool SERIAL_VERBOSE = false;
@@ -109,7 +112,7 @@ bool hasLastWorkingNetwork = false;
 bool awaitingNewNetworkToken = false;
 unsigned long newNetworkStartMs = 0;
 unsigned long lastBatterySampleMs = 0;
-const unsigned long batterySampleIntervalMs = 2000;  // read battery every 2s
+const unsigned long batterySampleIntervalMs = 5000;  // read battery every 5s
 float batteryAvgVoltage = 0.0f;
 float cachedBatteryPercent = 0.0f;
 unsigned long lastWifiAttemptMs = 0;
@@ -163,7 +166,6 @@ void setup() {
   ledcWrite(BACKLIGHT_PWM_CHANNEL, 0);  // keep off until the panel is ready
 
   analogSetPinAttenuation(BATTERY_ADC_PIN_PRIMARY, ADC_11db);
-  analogSetPinAttenuation(BATTERY_ADC_PIN_ALT, ADC_11db);
   cachedBatteryPercent = readBatteryPercent();
 
   // Touch
@@ -276,6 +278,8 @@ void loop() {
     float pressure = fetchPressure();
     if (pressure >= 0.0f) {
       lastPressureReading = pressure;
+      lastDataUpdateMs = millis();
+      lastDataStale = false;
       drawBar(pressure);
     }
   }
@@ -310,6 +314,16 @@ void loop() {
     if (nowBlink - lastBarBlinkMs >= criticalBlinkIntervalMs) {
       lastBarBlinkMs = nowBlink;
       drawBar(lastPressureReading);
+    }
+  }
+
+  bool dataIsStale =
+      lastDataUpdateMs > 0 && (millis() - lastDataUpdateMs >= dataStaleIntervalMs);
+  if (dataIsStale != lastDataStale) {
+    lastDataStale = dataIsStale;
+    drawBar(lastPressureReading);
+    if (dataIsStale) {
+      showStatus("Old data (>5m)");
     }
   }
 
@@ -494,9 +508,13 @@ void drawBar(float valueBar) {
   int filled = static_cast<int>(barHeight * (percent / 100.0f));
 
   // Choose color based on level and blink if critical
-  bool criticalBlink = percent < 10.0f;
+  bool dataIsStale =
+      lastDataUpdateMs > 0 && (millis() - lastDataUpdateMs >= dataStaleIntervalMs);
+  bool criticalBlink = !dataIsStale && percent < 10.0f;
   bool blinkOn = ((millis() / 500) % 2) == 0;  // 1Hz blink
-  uint16_t fillColor = (percent < 20.0f) ? COLOR_RED : COLOR_LIGHTBLUE;
+  uint16_t fillColor = dataIsStale
+                           ? COLOR_DARKGREY
+                           : ((percent < 20.0f) ? COLOR_RED : COLOR_LIGHTBLUE);
   if (criticalBlink && !blinkOn) {
     fillColor = COLOR_BLACK;
   }
@@ -519,11 +537,21 @@ void drawBar(float valueBar) {
     gfx->drawFastHLine(barLeft + 1, fillTop, barWidth - 2, COLOR_WHITE);
   }
 
-  gfx->fillRect(0, barTop - 40, screenW, 30, COLOR_BLACK);
-  gfx->setCursor(barLeft, barTop - 36);
-  gfx->setTextSize(3);
-  gfx->printf("%.0f%%", percent);
+  String percentText = String(static_cast<int>(percent + 0.5f)) + "%";
+  int textSize = 3;
+  int textWidth = percentText.length() * 6 * textSize;
+  int textHeight = 8 * textSize;
+  int textX = barLeft + ((barWidth - textWidth) / 2);
+  int textY = barTop + ((barHeight - textHeight) / 2);
+  if (textX < 0) textX = 0;
+  if (textY < 0) textY = 0;
+
+  gfx->setTextColor(COLOR_WHITE, fillColor);
+  gfx->setTextSize(textSize);
+  gfx->setCursor(textX, textY);
+  gfx->printf("%s", percentText.c_str());
   gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
 }
 
 void drawStatusIcons() {
@@ -553,13 +581,25 @@ void drawStatusIcons() {
     uint16_t color = (bars > i) ? COLOR_GREEN : COLOR_WHITE;
     gfx->fillRect(wifiX + (i * 8), wifiY + (18 - height), 6, height, color);
   }
+  gfx->setTextSize(1);
   gfx->setCursor(wifiX, wifiY + 24);
   gfx->print(ssid);
+  gfx->setTextSize(2);
+
+  String percentText = String(batteryPercent) + "%";
+  int percentTextSize = 2;
+  int percentWidth = percentText.length() * 6 * percentTextSize;
+  int percentHeight = 8 * percentTextSize;
 
   int batteryWidth = 34;
   int batteryHeight = 16;
-  int batteryX = screenW - batteryWidth - 16;
+  int batteryX = screenW - batteryWidth - 12;
   int batteryY = 8;
+  int percentX = batteryX - percentWidth - 6;
+  if (percentX < wifiX + 40) {
+    percentX = wifiX + 40;  // keep clear of Wi-Fi bars and SSID label
+  }
+  int percentY = batteryY + (batteryHeight / 2) - (percentHeight / 2);
 
   gfx->drawRect(batteryX, batteryY, batteryWidth, batteryHeight, COLOR_WHITE);
   gfx->fillRect(batteryX + batteryWidth, batteryY + (batteryHeight / 3), 4,
@@ -568,23 +608,45 @@ void drawStatusIcons() {
   int fillWidth = static_cast<int>((batteryWidth - 4) * (batteryPercent / 100.0f));
   gfx->fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4,
                 COLOR_GREEN);
-  gfx->setCursor(batteryX - 6, batteryY + batteryHeight + 10);
-  gfx->printf("%d%%", batteryPercent);
+
+  gfx->setTextSize(percentTextSize);
+  gfx->setCursor(percentX, percentY);
+  gfx->print(percentText);
+  gfx->setTextSize(2);
 }
 
 float readBatteryPercent() {
-  auto readMv = [](int pin) -> uint16_t {
+  auto medianReading = [](int pin) -> uint16_t {
     if (pin < 0) return 0;
-    return analogReadMilliVolts(pin);
+
+    // Take several samples to avoid occasional zero spikes from ADC noise.
+    uint16_t samples[5];
+    for (int i = 0; i < 5; i++) {
+      samples[i] = analogReadMilliVolts(pin);
+      delay(2);
+    }
+    std::sort(std::begin(samples), std::end(samples));
+
+    // If all samples are zero the pin is likely disconnected.
+    if (samples[4] == 0) return 0;
+
+    // Use the middle value to ignore outliers.
+    return samples[2];
   };
 
-  uint16_t mvPrimary = readMv(BATTERY_ADC_PIN_PRIMARY);
-  uint16_t mvAlt = readMv(BATTERY_ADC_PIN_ALT);
-  uint16_t millivolts = mvPrimary;
-  if (millivolts == 0 && mvAlt > 0) {
-    millivolts = mvAlt;
-  } else if (mvAlt > millivolts) {
-    millivolts = mvAlt;
+  // Only sample the documented battery pin; alternate pins float high on some
+  // boards and create artificial 100% readings.
+  uint16_t millivolts = medianReading(BATTERY_ADC_PIN_PRIMARY);
+
+  // If the pin reads zero but we already have an average, keep the existing
+  // filtered value to avoid spurious drops to 0% when the ADC glitches.
+  if (millivolts == 0 && batteryAvgVoltage > 0.01f) {
+    float percent =
+        ((batteryAvgVoltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) *
+        100.0f;
+    if (percent < 0.0f) percent = 0.0f;
+    if (percent > 100.0f) percent = 100.0f;
+    return percent;
   }
 
   float voltage = (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
