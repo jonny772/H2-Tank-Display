@@ -36,7 +36,9 @@ constexpr int BATTERY_ADC_PIN_PRIMARY = 2;
 constexpr int BATTERY_ADC_PIN_ALT = 8;
 constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // voltage divider halves battery voltage
 constexpr float BATTERY_MIN_V = 3.3f;
-constexpr float BATTERY_MAX_V = 4.2f;
+constexpr float BATTERY_MAX_V = 4.0f;
+
+constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
 
 // Color aliases
 constexpr uint16_t COLOR_BLACK = RGB565_BLACK;
@@ -97,6 +99,7 @@ const unsigned long dataFetchIntervalMs = 30000;  // 30s polling
 unsigned long lastDataFetchMs = 0;
 unsigned long lastStatusDrawMs = 0;
 const unsigned long statusDrawIntervalMs = 2000;  // redraw top bar every 2 seconds
+const unsigned long criticalBlinkIntervalMs = 500;  // bar blink cadence for <10%
 unsigned long lastWifiTapMs = 0;
 const unsigned long doubleTapWindowMs = 500;  // ms between taps to open WiFi
 constexpr bool SERIAL_VERBOSE = false;
@@ -108,8 +111,10 @@ unsigned long newNetworkStartMs = 0;
 unsigned long lastBatterySampleMs = 0;
 const unsigned long batterySampleIntervalMs = 2000;  // read battery every 2s
 float batteryAvgVoltage = 0.0f;
+float cachedBatteryPercent = 0.0f;
 unsigned long lastWifiAttemptMs = 0;
 const unsigned long wifiReconnectIntervalMs = 15000;
+unsigned long lastBarBlinkMs = 0;
 
 struct TouchEvent {
   int16_t x;
@@ -159,6 +164,7 @@ void setup() {
 
   analogSetPinAttenuation(BATTERY_ADC_PIN_PRIMARY, ADC_11db);
   analogSetPinAttenuation(BATTERY_ADC_PIN_ALT, ADC_11db);
+  cachedBatteryPercent = readBatteryPercent();
 
   // Touch
   pinMode(TOUCH_RES, OUTPUT);
@@ -279,7 +285,7 @@ void loop() {
     lastStatusDrawMs = now;
     if (now - lastBatterySampleMs >= batterySampleIntervalMs) {
       // Touch battery only when we are about to draw status to keep load low.
-      readBatteryPercent();
+      cachedBatteryPercent = readBatteryPercent();
       lastBatterySampleMs = now;
     }
     drawStatusIcons();
@@ -294,6 +300,16 @@ void loop() {
       accessToken = "";
       tokenExpiresAt = 0;
       connectWiFi();
+    }
+  }
+
+  // Force redraws when in critical range so the bar actually flashes.
+  float percent = (lastPressureReading / MAX_BAR_VALUE) * 100.0f;
+  if (percent < 10.0f) {
+    unsigned long nowBlink = millis();
+    if (nowBlink - lastBarBlinkMs >= criticalBlinkIntervalMs) {
+      lastBarBlinkMs = nowBlink;
+      drawBar(lastPressureReading);
     }
   }
 
@@ -321,6 +337,7 @@ void connectWiFi() {
     while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
       delay(150);
       attempts++;
+      yield();
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -344,6 +361,7 @@ bool refreshAccessToken() {
 
   http.begin(secureClient, tokenUrl);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   String body = String("grant_type=client_credentials&client_id=") + CLIENT_ID +
                 "&client_secret=" + CLIENT_SECRET +
@@ -358,7 +376,7 @@ bool refreshAccessToken() {
     return false;
   }
 
-  DynamicJsonDocument doc(2048);
+  StaticJsonDocument<2048> doc;
   DeserializationError err = deserializeJson(doc, http.getStream());
   if (err) {
     showStatus("Token parse");
@@ -398,6 +416,7 @@ float fetchPressure() {
   http.addHeader("Authorization", String("Bearer ") + accessToken);
   http.addHeader("Accept", "application/json");
   http.addHeader("Accept-Encoding", "identity");  // avoid gzip
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   int status = http.GET();
   if (status != HTTP_CODE_OK) {
@@ -416,7 +435,7 @@ float fetchPressure() {
   filter["variable_name"] = true;
   filter["last_value"] = true;
 
-  DynamicJsonDocument doc(768);
+  StaticJsonDocument<768> doc;
   DeserializationError err =
       deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   if (err) {
@@ -508,22 +527,34 @@ void drawBar(float valueBar) {
 }
 
 void drawStatusIcons() {
+  static int lastWifiBars = -1;
+  static String lastSsid = "";
+  static int lastBatteryPercent = -1;
+
+  bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  String ssid = wifiConnected ? WiFi.SSID() : "No WiFi";
+  int bars = wifiConnected ? wifiBars() : 0;
+  int batteryPercent = static_cast<int>(cachedBatteryPercent + 0.5f);
+
+  if (bars == lastWifiBars && ssid == lastSsid && batteryPercent == lastBatteryPercent) {
+    return;  // Nothing to redraw; avoid extra fillRects on the constrained ESP32S3.
+  }
+
+  lastWifiBars = bars;
+  lastSsid = ssid;
+  lastBatteryPercent = batteryPercent;
+
   gfx->fillRect(0, 0, screenW, 60, COLOR_BLACK);
 
   int wifiX = 8;
   int wifiY = 6;
-  int bars = wifiBars();
   for (int i = 0; i < 3; i++) {
     int height = 6 + (i * 4);
     uint16_t color = (bars > i) ? COLOR_GREEN : COLOR_WHITE;
     gfx->fillRect(wifiX + (i * 8), wifiY + (18 - height), 6, height, color);
   }
   gfx->setCursor(wifiX, wifiY + 24);
-  if (WiFi.status() == WL_CONNECTED) {
-    gfx->print(WiFi.SSID());
-  } else {
-    gfx->print("No WiFi");
-  }
+  gfx->print(ssid);
 
   int batteryWidth = 34;
   int batteryHeight = 16;
@@ -534,12 +565,11 @@ void drawStatusIcons() {
   gfx->fillRect(batteryX + batteryWidth, batteryY + (batteryHeight / 3), 4,
                 batteryHeight / 3, COLOR_WHITE);
 
-  float batteryPercent = readBatteryPercent();
   int fillWidth = static_cast<int>((batteryWidth - 4) * (batteryPercent / 100.0f));
   gfx->fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4,
                 COLOR_GREEN);
   gfx->setCursor(batteryX - 6, batteryY + batteryHeight + 10);
-  gfx->printf("%.0f%%", batteryPercent);
+  gfx->printf("%d%%", batteryPercent);
 }
 
 float readBatteryPercent() {
@@ -565,7 +595,6 @@ float readBatteryPercent() {
     // Simple low-pass filter (alpha ~0.2)
     batteryAvgVoltage = (batteryAvgVoltage * 0.8f) + (voltage * 0.2f);
   }
-  float vForPercent = batteryAvgVoltage;
   float percent = ((voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) * 100.0f;
   if (percent < 0.0f) percent = 0.0f;
   if (percent > 100.0f) percent = 100.0f;
@@ -585,6 +614,7 @@ bool hasInternetConnectivity() {
 
   HTTPClient http;
   http.begin("http://connectivitycheck.gstatic.com/generate_204");
+  http.setTimeout(HTTP_TIMEOUT_MS);
   int status = http.GET();
   http.end();
   return status == HTTP_CODE_NO_CONTENT;
