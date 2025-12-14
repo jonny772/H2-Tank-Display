@@ -9,6 +9,7 @@
 #include <Wire.h>
 #include <vector>
 #include <algorithm>
+#include <iterator>
 
 // Wi-Fi credentials - ONLY 1 DEFAULT OTHERS ADDED BY UI. Will persist across flashes
 constexpr char WIFI_SSID[] = "LUinc-Members";
@@ -617,16 +618,27 @@ void drawStatusIcons() {
 }
 
 float readBatteryPercent() {
-  auto readMv = [](int pin) -> uint16_t {
+  auto medianReading = [](int pin) -> uint16_t {
     if (pin < 0) return 0;
-    return analogReadMilliVolts(pin);
+
+    // Take several samples to avoid occasional zero spikes from ADC noise.
+    uint16_t samples[5];
+    for (int i = 0; i < 5; i++) {
+      samples[i] = analogReadMilliVolts(pin);
+      delay(2);
+    }
+    std::sort(std::begin(samples), std::end(samples));
+
+    // If all samples are zero the pin is likely disconnected.
+    if (samples[4] == 0) return 0;
+
+    // Use the middle value to ignore outliers (e.g., floating alt pin highs).
+    return samples[2];
   };
 
-  uint16_t mvPrimary = readMv(BATTERY_ADC_PIN_PRIMARY);
-  uint16_t mvAlt = readMv(BATTERY_ADC_PIN_ALT);
-  // Prefer the primary pin; only fall back to the alt pin when the primary is
-  // clearly disconnected (reads 0). The alt pin can float high on some board
-  // definitions, which previously caused percentage spikes.
+  uint16_t mvPrimary = medianReading(BATTERY_ADC_PIN_PRIMARY);
+  // Only use the alternate pin if the primary consistently reads zero.
+  uint16_t mvAlt = (mvPrimary == 0) ? medianReading(BATTERY_ADC_PIN_ALT) : 0;
   uint16_t millivolts = (mvPrimary > 0) ? mvPrimary : mvAlt;
 
   float voltage = (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
