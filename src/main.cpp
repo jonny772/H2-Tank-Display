@@ -32,9 +32,8 @@ constexpr char PROPERTY_ID[] = "26ac0e3f-49cf-484d-9f08-ca02a8c49698";
 // Pressure scaling
 constexpr float MAX_BAR_VALUE = 1.5f;  // 100%
 
-// Battery monitor pins (board variants show BAT_VOLT on GPIO2; some defs use GPIO8). Read both.
+// Battery monitor pin
 constexpr int BATTERY_ADC_PIN_PRIMARY = 2;
-constexpr int BATTERY_ADC_PIN_ALT = 8;
 constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // voltage divider halves battery voltage
 constexpr float BATTERY_MIN_V = 3.3f;
 constexpr float BATTERY_MAX_V = 4.0f;
@@ -167,7 +166,6 @@ void setup() {
   ledcWrite(BACKLIGHT_PWM_CHANNEL, 0);  // keep off until the panel is ready
 
   analogSetPinAttenuation(BATTERY_ADC_PIN_PRIMARY, ADC_11db);
-  analogSetPinAttenuation(BATTERY_ADC_PIN_ALT, ADC_11db);
   cachedBatteryPercent = readBatteryPercent();
 
   // Touch
@@ -618,9 +616,6 @@ void drawStatusIcons() {
 }
 
 float readBatteryPercent() {
-  static uint8_t primaryZeroStreak = 0;
-  constexpr uint8_t primaryZeroThreshold = 3;  // require persistent zeros before alt pin
-
   auto medianReading = [](int pin) -> uint16_t {
     if (pin < 0) return 0;
 
@@ -635,25 +630,15 @@ float readBatteryPercent() {
     // If all samples are zero the pin is likely disconnected.
     if (samples[4] == 0) return 0;
 
-    // Use the middle value to ignore outliers (e.g., floating alt pin highs).
+    // Use the middle value to ignore outliers.
     return samples[2];
   };
 
-  uint16_t mvPrimary = medianReading(BATTERY_ADC_PIN_PRIMARY);
-  bool primaryValid = mvPrimary > 0;
-  if (!primaryValid) {
-    if (primaryZeroStreak < primaryZeroThreshold) primaryZeroStreak++;
-  } else {
-    primaryZeroStreak = 0;
-  }
+  // Only sample the documented battery pin; alternate pins float high on some
+  // boards and create artificial 100% readings.
+  uint16_t millivolts = medianReading(BATTERY_ADC_PIN_PRIMARY);
 
-  // Only use the alternate pin if the primary has been zero for several reads
-  // (prevents floating highs on unused boards).
-  bool allowAlt = (!primaryValid && primaryZeroStreak >= primaryZeroThreshold);
-  uint16_t mvAlt = allowAlt ? medianReading(BATTERY_ADC_PIN_ALT) : 0;
-  uint16_t millivolts = primaryValid ? mvPrimary : mvAlt;
-
-  // If both pins read zero but we already have an average, keep the existing
+  // If the pin reads zero but we already have an average, keep the existing
   // filtered value to avoid spurious drops to 0% when the ADC glitches.
   if (millivolts == 0 && batteryAvgVoltage > 0.01f) {
     float percent =
