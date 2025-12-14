@@ -113,7 +113,7 @@ bool hasLastWorkingNetwork = false;
 bool awaitingNewNetworkToken = false;
 unsigned long newNetworkStartMs = 0;
 unsigned long lastBatterySampleMs = 0;
-const unsigned long batterySampleIntervalMs = 2000;  // read battery every 2s
+const unsigned long batterySampleIntervalMs = 5000;  // read battery every 5s
 float batteryAvgVoltage = 0.0f;
 float cachedBatteryPercent = 0.0f;
 unsigned long lastWifiAttemptMs = 0;
@@ -618,6 +618,9 @@ void drawStatusIcons() {
 }
 
 float readBatteryPercent() {
+  static uint8_t primaryZeroStreak = 0;
+  constexpr uint8_t primaryZeroThreshold = 3;  // require persistent zeros before alt pin
+
   auto medianReading = [](int pin) -> uint16_t {
     if (pin < 0) return 0;
 
@@ -637,9 +640,29 @@ float readBatteryPercent() {
   };
 
   uint16_t mvPrimary = medianReading(BATTERY_ADC_PIN_PRIMARY);
-  // Only use the alternate pin if the primary consistently reads zero.
-  uint16_t mvAlt = (mvPrimary == 0) ? medianReading(BATTERY_ADC_PIN_ALT) : 0;
-  uint16_t millivolts = (mvPrimary > 0) ? mvPrimary : mvAlt;
+  bool primaryValid = mvPrimary > 0;
+  if (!primaryValid) {
+    if (primaryZeroStreak < primaryZeroThreshold) primaryZeroStreak++;
+  } else {
+    primaryZeroStreak = 0;
+  }
+
+  // Only use the alternate pin if the primary has been zero for several reads
+  // (prevents floating highs on unused boards).
+  bool allowAlt = (!primaryValid && primaryZeroStreak >= primaryZeroThreshold);
+  uint16_t mvAlt = allowAlt ? medianReading(BATTERY_ADC_PIN_ALT) : 0;
+  uint16_t millivolts = primaryValid ? mvPrimary : mvAlt;
+
+  // If both pins read zero but we already have an average, keep the existing
+  // filtered value to avoid spurious drops to 0% when the ADC glitches.
+  if (millivolts == 0 && batteryAvgVoltage > 0.01f) {
+    float percent =
+        ((batteryAvgVoltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)) *
+        100.0f;
+    if (percent < 0.0f) percent = 0.0f;
+    if (percent > 100.0f) percent = 100.0f;
+    return percent;
+  }
 
   float voltage = (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
   // Rolling average over ~20s (sampled every ~2s) for smoother display
