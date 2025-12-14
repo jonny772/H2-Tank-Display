@@ -278,10 +278,15 @@ void loop() {
     lastDataFetchMs = millis();
     float pressure = fetchPressure();
     if (pressure >= 0.0f) {
-      lastPressureReading = pressure;
+      if (lastPressureReading <= 0.001f) {
+        lastPressureReading = pressure;  // first valid sample, no smoothing
+      } else {
+        // Low-pass filter to avoid jittering display when readings fluctuate
+        lastPressureReading = (lastPressureReading * 0.8f) + (pressure * 0.2f);
+      }
       lastDataUpdateMs = millis();
       dataOldNotified = false;
-      drawBar(pressure);
+      drawBar(lastPressureReading);
     }
   }
 
