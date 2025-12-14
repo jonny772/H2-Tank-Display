@@ -587,10 +587,20 @@ void drawStatusIcons() {
   gfx->print(ssid);
   gfx->setTextSize(2);
 
+  String percentText = String(batteryPercent) + "%";
+  int percentTextSize = 2;
+  int percentWidth = percentText.length() * 6 * percentTextSize;
+  int percentHeight = 8 * percentTextSize;
+
   int batteryWidth = 34;
   int batteryHeight = 16;
-  int batteryX = screenW - batteryWidth - 16;
+  int batteryX = screenW - batteryWidth - 12;
   int batteryY = 8;
+  int percentX = batteryX - percentWidth - 6;
+  if (percentX < wifiX + 40) {
+    percentX = wifiX + 40;  // keep clear of Wi-Fi bars and SSID label
+  }
+  int percentY = batteryY + (batteryHeight / 2) - (percentHeight / 2);
 
   gfx->drawRect(batteryX, batteryY, batteryWidth, batteryHeight, COLOR_WHITE);
   gfx->fillRect(batteryX + batteryWidth, batteryY + (batteryHeight / 3), 4,
@@ -599,10 +609,11 @@ void drawStatusIcons() {
   int fillWidth = static_cast<int>((batteryWidth - 4) * (batteryPercent / 100.0f));
   gfx->fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4,
                 COLOR_GREEN);
-  int textHeight = 8 * 2;
-  gfx->setCursor(batteryX + batteryWidth + 6,
-                 batteryY + (batteryHeight / 2) - (textHeight / 2));
-  gfx->printf("%d%%", batteryPercent);
+
+  gfx->setTextSize(percentTextSize);
+  gfx->setCursor(percentX, percentY);
+  gfx->print(percentText);
+  gfx->setTextSize(2);
 }
 
 float readBatteryPercent() {
