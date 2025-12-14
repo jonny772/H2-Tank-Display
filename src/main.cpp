@@ -45,7 +45,7 @@ constexpr uint16_t COLOR_BLACK = RGB565_BLACK;
 constexpr uint16_t COLOR_WHITE = RGB565_WHITE;
 constexpr uint16_t COLOR_GREEN = RGB565_GREEN;
 constexpr uint16_t COLOR_YELLOW = RGB565_YELLOW;
-constexpr uint16_t COLOR_DARKGREY = RGB565_NAVY;
+constexpr uint16_t COLOR_DARKGREY = 0x8410;  // mid grey
 constexpr uint16_t COLOR_LIGHTBLUE = RGB565_CYAN;
 constexpr uint16_t COLOR_RED = RGB565_RED;
 
@@ -115,6 +115,9 @@ float cachedBatteryPercent = 0.0f;
 unsigned long lastWifiAttemptMs = 0;
 const unsigned long wifiReconnectIntervalMs = 15000;
 unsigned long lastBarBlinkMs = 0;
+unsigned long lastDataUpdateMs = 0;
+const unsigned long dataStaleMs = 5UL * 60UL * 1000UL;
+bool dataOldNotified = false;
 
 struct TouchEvent {
   int16_t x;
@@ -276,6 +279,8 @@ void loop() {
     float pressure = fetchPressure();
     if (pressure >= 0.0f) {
       lastPressureReading = pressure;
+      lastDataUpdateMs = millis();
+      dataOldNotified = false;
       drawBar(pressure);
     }
   }
@@ -289,6 +294,12 @@ void loop() {
       lastBatterySampleMs = now;
     }
     drawStatusIcons();
+  }
+
+  if (lastDataUpdateMs > 0 && (now - lastDataUpdateMs > dataStaleMs) &&
+      !dataOldNotified) {
+    showStatus("Old data");
+    dataOldNotified = true;
   }
 
   // If we tried a new network and failed to get a token within 60s, revert to last working.
@@ -494,10 +505,13 @@ void drawBar(float valueBar) {
   int filled = static_cast<int>(barHeight * (percent / 100.0f));
 
   // Choose color based on level and blink if critical
-  bool criticalBlink = percent < 10.0f;
+  bool dataIsOld = lastDataUpdateMs > 0 && (millis() - lastDataUpdateMs > dataStaleMs);
+  bool criticalBlink = !dataIsOld && percent < 10.0f;
   bool blinkOn = ((millis() / 500) % 2) == 0;  // 1Hz blink
   uint16_t fillColor = (percent < 20.0f) ? COLOR_RED : COLOR_LIGHTBLUE;
-  if (criticalBlink && !blinkOn) {
+  if (dataIsOld) {
+    fillColor = COLOR_DARKGREY;
+  } else if (criticalBlink && !blinkOn) {
     fillColor = COLOR_BLACK;
   }
 
@@ -519,10 +533,18 @@ void drawBar(float valueBar) {
     gfx->drawFastHLine(barLeft + 1, fillTop, barWidth - 2, COLOR_WHITE);
   }
 
-  gfx->fillRect(0, barTop - 40, screenW, 30, COLOR_BLACK);
-  gfx->setCursor(barLeft, barTop - 36);
+  String percentStr = String(static_cast<int>(percent + 0.5f)) + "%";
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
   gfx->setTextSize(3);
-  gfx->printf("%.0f%%", percent);
+  gfx->getTextBounds(percentStr.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+  int labelX = barLeft + (barWidth - tbw) / 2;
+  int labelY = barTop + (barHeight - tbh) / 2;
+  int padding = 4;
+  gfx->fillRect(labelX - padding, labelY - padding, tbw + padding * 2,
+                tbh + padding * 2, COLOR_BLACK);
+  gfx->setCursor(labelX, labelY);
+  gfx->print(percentStr);
   gfx->setTextSize(2);
 }
 
@@ -553,8 +575,10 @@ void drawStatusIcons() {
     uint16_t color = (bars > i) ? COLOR_GREEN : COLOR_WHITE;
     gfx->fillRect(wifiX + (i * 8), wifiY + (18 - height), 6, height, color);
   }
+  gfx->setTextSize(1);
   gfx->setCursor(wifiX, wifiY + 24);
   gfx->print(ssid);
+  gfx->setTextSize(2);
 
   int batteryWidth = 34;
   int batteryHeight = 16;
@@ -568,8 +592,16 @@ void drawStatusIcons() {
   int fillWidth = static_cast<int>((batteryWidth - 4) * (batteryPercent / 100.0f));
   gfx->fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4,
                 COLOR_GREEN);
-  gfx->setCursor(batteryX - 6, batteryY + batteryHeight + 10);
-  gfx->printf("%d%%", batteryPercent);
+  String batteryStr = String(batteryPercent) + "%";
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+  gfx->getTextBounds(batteryStr.c_str(), 0, 0, &tbx, &tby, &tbw, &tbh);
+  int labelX = batteryX + batteryWidth + 8;
+  int maxLabelX = screenW - static_cast<int>(tbw) - 2;
+  if (labelX > maxLabelX) labelX = maxLabelX;
+  int labelY = batteryY + (batteryHeight - static_cast<int>(tbh)) / 2;
+  gfx->setCursor(labelX, labelY);
+  gfx->print(batteryStr);
 }
 
 float readBatteryPercent() {
