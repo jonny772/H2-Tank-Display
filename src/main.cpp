@@ -98,8 +98,11 @@ float lastPressureReading = 0.0f;
 const unsigned long dataFetchIntervalMs = 30000;  // 30s polling
 unsigned long lastDataFetchMs = 0;
 unsigned long lastStatusDrawMs = 0;
+unsigned long lastDataUpdateMs = 0;
+bool lastDataStale = false;
 const unsigned long statusDrawIntervalMs = 2000;  // redraw top bar every 2 seconds
 const unsigned long criticalBlinkIntervalMs = 500;  // bar blink cadence for <10%
+const unsigned long dataStaleIntervalMs = 5UL * 60UL * 1000UL;  // 5 minutes
 unsigned long lastWifiTapMs = 0;
 const unsigned long doubleTapWindowMs = 500;  // ms between taps to open WiFi
 constexpr bool SERIAL_VERBOSE = false;
@@ -276,6 +279,8 @@ void loop() {
     float pressure = fetchPressure();
     if (pressure >= 0.0f) {
       lastPressureReading = pressure;
+      lastDataUpdateMs = millis();
+      lastDataStale = false;
       drawBar(pressure);
     }
   }
@@ -310,6 +315,16 @@ void loop() {
     if (nowBlink - lastBarBlinkMs >= criticalBlinkIntervalMs) {
       lastBarBlinkMs = nowBlink;
       drawBar(lastPressureReading);
+    }
+  }
+
+  bool dataIsStale =
+      lastDataUpdateMs > 0 && (millis() - lastDataUpdateMs >= dataStaleIntervalMs);
+  if (dataIsStale != lastDataStale) {
+    lastDataStale = dataIsStale;
+    drawBar(lastPressureReading);
+    if (dataIsStale) {
+      showStatus("Old data (>5m)");
     }
   }
 
@@ -494,9 +509,13 @@ void drawBar(float valueBar) {
   int filled = static_cast<int>(barHeight * (percent / 100.0f));
 
   // Choose color based on level and blink if critical
-  bool criticalBlink = percent < 10.0f;
+  bool dataIsStale =
+      lastDataUpdateMs > 0 && (millis() - lastDataUpdateMs >= dataStaleIntervalMs);
+  bool criticalBlink = !dataIsStale && percent < 10.0f;
   bool blinkOn = ((millis() / 500) % 2) == 0;  // 1Hz blink
-  uint16_t fillColor = (percent < 20.0f) ? COLOR_RED : COLOR_LIGHTBLUE;
+  uint16_t fillColor = dataIsStale
+                           ? COLOR_DARKGREY
+                           : ((percent < 20.0f) ? COLOR_RED : COLOR_LIGHTBLUE);
   if (criticalBlink && !blinkOn) {
     fillColor = COLOR_BLACK;
   }
@@ -519,11 +538,21 @@ void drawBar(float valueBar) {
     gfx->drawFastHLine(barLeft + 1, fillTop, barWidth - 2, COLOR_WHITE);
   }
 
-  gfx->fillRect(0, barTop - 40, screenW, 30, COLOR_BLACK);
-  gfx->setCursor(barLeft, barTop - 36);
-  gfx->setTextSize(3);
-  gfx->printf("%.0f%%", percent);
+  String percentText = String(static_cast<int>(percent + 0.5f)) + "%";
+  int textSize = 3;
+  int textWidth = percentText.length() * 6 * textSize;
+  int textHeight = 8 * textSize;
+  int textX = barLeft + ((barWidth - textWidth) / 2);
+  int textY = barTop + ((barHeight - textHeight) / 2);
+  if (textX < 0) textX = 0;
+  if (textY < 0) textY = 0;
+
+  gfx->setTextColor(COLOR_WHITE, fillColor);
+  gfx->setTextSize(textSize);
+  gfx->setCursor(textX, textY);
+  gfx->printf("%s", percentText.c_str());
   gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
 }
 
 void drawStatusIcons() {
@@ -553,8 +582,10 @@ void drawStatusIcons() {
     uint16_t color = (bars > i) ? COLOR_GREEN : COLOR_WHITE;
     gfx->fillRect(wifiX + (i * 8), wifiY + (18 - height), 6, height, color);
   }
+  gfx->setTextSize(1);
   gfx->setCursor(wifiX, wifiY + 24);
   gfx->print(ssid);
+  gfx->setTextSize(2);
 
   int batteryWidth = 34;
   int batteryHeight = 16;
@@ -568,7 +599,9 @@ void drawStatusIcons() {
   int fillWidth = static_cast<int>((batteryWidth - 4) * (batteryPercent / 100.0f));
   gfx->fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4,
                 COLOR_GREEN);
-  gfx->setCursor(batteryX - 6, batteryY + batteryHeight + 10);
+  int textHeight = 8 * 2;
+  gfx->setCursor(batteryX + batteryWidth + 6,
+                 batteryY + (batteryHeight / 2) - (textHeight / 2));
   gfx->printf("%d%%", batteryPercent);
 }
 
