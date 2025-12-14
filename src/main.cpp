@@ -624,12 +624,10 @@ float readBatteryPercent() {
 
   uint16_t mvPrimary = readMv(BATTERY_ADC_PIN_PRIMARY);
   uint16_t mvAlt = readMv(BATTERY_ADC_PIN_ALT);
-  uint16_t millivolts = mvPrimary;
-  if (millivolts == 0 && mvAlt > 0) {
-    millivolts = mvAlt;
-  } else if (mvAlt > millivolts) {
-    millivolts = mvAlt;
-  }
+  // Prefer the primary pin; only fall back to the alt pin when the primary is
+  // clearly disconnected (reads 0). The alt pin can float high on some board
+  // definitions, which previously caused percentage spikes.
+  uint16_t millivolts = (mvPrimary > 0) ? mvPrimary : mvAlt;
 
   float voltage = (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
   // Rolling average over ~20s (sampled every ~2s) for smoother display
