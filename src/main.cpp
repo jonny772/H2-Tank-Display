@@ -610,21 +610,40 @@ void drawStatusIcons() {
 }
 
 float readBatteryPercent() {
-  auto readMv = [](int pin) -> uint16_t {
+  auto sampleMv = [](int pin) -> uint16_t {
     if (pin < 0) return 0;
-    return analogReadMilliVolts(pin);
+    const int samples = 8;
+    uint32_t total = 0;
+    int count = 0;
+    for (int i = 0; i < samples; i++) {
+      uint16_t mv = analogReadMilliVolts(pin);
+      if (mv > 0) {
+        total += mv;
+        count++;
+      }
+      delay(2);  // small settle to avoid back-to-back noise
+    }
+    return count > 0 ? static_cast<uint16_t>(total / count) : 0;
   };
 
-  uint16_t mvPrimary = readMv(BATTERY_ADC_PIN_PRIMARY);
-  uint16_t mvAlt = readMv(BATTERY_ADC_PIN_ALT);
-  uint16_t millivolts = mvPrimary;
-  if (millivolts == 0 && mvAlt > 0) {
-    millivolts = mvAlt;
-  } else if (mvAlt > millivolts) {
+  auto plausibleMv = [](uint16_t mv) {
+    // Expect ~1600-2000mV on the divider for a 3.3-4.0V cell; filter floaty pins
+    return mv >= 1200 && mv <= 2300;
+  };
+
+  uint16_t mvPrimary = sampleMv(BATTERY_ADC_PIN_PRIMARY);
+  uint16_t mvAlt = sampleMv(BATTERY_ADC_PIN_ALT);
+
+  uint16_t millivolts = 0;
+  if (plausibleMv(mvPrimary)) {
+    millivolts = mvPrimary;
+  } else if (plausibleMv(mvAlt)) {
     millivolts = mvAlt;
   }
 
-  float voltage = (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
+  // If neither pin reads plausibly, keep prior voltage to avoid wild swings.
+  float voltage = millivolts > 0 ? (millivolts / 1000.0f) * BATTERY_DIVIDER_RATIO
+                                 : batteryAvgVoltage;
   // Rolling average over ~20s (sampled every ~2s) for smoother display
   if (batteryAvgVoltage <= 0.01f) {
     batteryAvgVoltage = voltage;
